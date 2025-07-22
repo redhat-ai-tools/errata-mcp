@@ -1,2 +1,5 @@
-httpx
+# Core MCP dependencies
 fastmcp
+
+# Errata Tool integration
+errata-tool
