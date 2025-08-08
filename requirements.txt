@@ -3,3 +3,7 @@ fastmcp
 
 # Errata Tool integration
 errata-tool
+
+# HTTP and Kerberos auth for Errata HTTP API
+requests
+requests-gssapi

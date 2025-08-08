@@ -10,11 +10,18 @@ import asyncio
 import json
 import logging
 import os
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from fastmcp import FastMCP
 from errata_tool import Erratum
 from errata_tool.product import Product
 from errata_tool.release import Release
+import requests
+try:
+    # requests_gssapi is the modern replacement for requests-kerberos
+    from requests_gssapi import HTTPSPNEGOAuth, REQUIRED as GSSAPI_REQUIRED
+except Exception:  # pragma: no cover - fall back if not installed
+    HTTPSPNEGOAuth = None  # type: ignore
+    GSSAPI_REQUIRED = None  # type: ignore
 
 # Configure SSL certificate bundle for Red Hat internal CAs
 # This ensures requests can verify Red Hat internal SSL certificates
@@ -40,6 +47,104 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastMCP server
 mcp = FastMCP("errata-mcp-server")
+
+def _get_errata_base_url() -> str:
+    """Resolve the Errata Tool base URL (prod by default, stage if requested)."""
+    explicit = os.environ.get("ERRATA_BASE_URL")
+    if explicit:
+        return explicit.rstrip('/') + '/'
+    if os.environ.get("ERRATA_STAGE") in {"1", "true", "True"}:
+        return "https://errata.stage.engineering.redhat.com/"
+    return "https://errata.engineering.redhat.com/"
+
+
+def _http_get_errata_json(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], str]:
+    """
+    Perform an authenticated GET to the Errata Tool HTTP API and return JSON.
+
+    Returns: (json, url)
+    Raises: Exception on non-2xx or parsing issues.
+    """
+    base = _get_errata_base_url()
+    url = f"{base}api/v1/{path.lstrip('/')}"
+
+    session = requests.Session()
+    verify = os.environ.get('REQUESTS_CA_BUNDLE') or True
+
+    if HTTPSPNEGOAuth is None:
+        raise RuntimeError(
+            "requests-gssapi is required for Kerberos authentication. Please 'pip install requests-gssapi'."
+        )
+
+    auth = HTTPSPNEGOAuth(mutual_authentication=GSSAPI_REQUIRED)
+    logger.debug(f"GET {url} params={params}")
+    resp = session.get(url, params=params or {}, auth=auth, verify=verify, timeout=60)
+    if resp.status_code == 401:
+        raise PermissionError("Unauthorized (401). Ensure you have a valid Kerberos ticket (kinit) and network access.")
+    if resp.status_code == 403:
+        raise PermissionError("Forbidden (403). Your account may not have access to this advisory or environment.")
+    if resp.status_code == 404:
+        raise FileNotFoundError(f"Not found (404): {url}")
+    if not resp.ok:
+        raise RuntimeError(f"Errata API error {resp.status_code}: {resp.text}")
+
+    try:
+        return resp.json(), resp.url
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse JSON from {url}: {exc}")
+
+
+def _fetch_builds_list_with_signing(advisory_id: int) -> Dict[str, Any]:
+    """
+    Fetch /api/v1/erratum/{id}/builds_list?with_sig_key=1 and return the JSON.
+    """
+    data, final_url = _http_get_errata_json(
+        f"erratum/{advisory_id}/builds_list",
+        params={"with_sig_key": 1},
+    )
+    logger.info(f"Fetched builds_list for {advisory_id} ({final_url})")
+    return data
+
+
+def _summarize_signing(builds_list: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute a concise signing summary across all product versions and builds."""
+    total_builds = 0
+    unsigned_build_nvrs: List[str] = []
+    total_files = 0
+    unsigned_files = 0
+
+    # Iterate product versions
+    for _pv_name, pv in builds_list.items():
+        builds = pv.get("builds", [])
+        for bwrap in builds:
+            # Each build is a single-key dict like {"nvr": {...}}
+            if not isinstance(bwrap, dict) or not bwrap:
+                continue
+            (nvr_key, binfo), = bwrap.items()  # type: ignore
+            total_builds += 1
+
+            # Track build-level signed
+            is_build_signed = bool(binfo.get("is_signed", False))
+            if not is_build_signed:
+                unsigned_build_nvrs.append(nvr_key)
+
+            # Count per-file signing state
+            variant_arch = binfo.get("variant_arch", {}) or {}
+            for _variant, arches in variant_arch.items():
+                for _arch, files in arches.items():
+                    for f in files:
+                        total_files += 1
+                        if not f.get("is_signed", False):
+                            unsigned_files += 1
+
+    return {
+        "total_builds": total_builds,
+        "unsigned_builds": unsigned_build_nvrs,
+        "all_builds_signed": total_builds > 0 and len(unsigned_build_nvrs) == 0,
+        "total_files": total_files,
+        "unsigned_files": unsigned_files,
+        "all_files_signed": total_files > 0 and unsigned_files == 0,
+    }
 
 def list_products() -> List[str]:
     """
@@ -140,6 +245,18 @@ def get_advisory_info(advisory_id: str) -> Dict[str, Any]:
         # Add security-specific info if available
         if hasattr(erratum, 'security_impact'):
             advisory_info['security_impact'] = erratum.security_impact
+        
+        # Fetch builds_list with signing info and add a concise summary
+        try:
+            builds_list = _fetch_builds_list_with_signing(erratum.errata_id)
+            signing_summary = _summarize_signing(builds_list)
+            advisory_info['builds_signing_summary'] = signing_summary
+            advisory_info['builds_list_url'] = f"{_get_errata_base_url()}api/v1/erratum/{erratum.errata_id}/builds_list?with_sig_key=1"
+        except Exception as fetch_exc:
+            logger.warning(f"Failed to fetch builds signing info for {advisory_id}: {fetch_exc}")
+            advisory_info['builds_signing_summary'] = {
+                "error": str(fetch_exc)
+            }
             
         print("Advisory info retrieved successfully.")
         return advisory_info
@@ -268,6 +385,38 @@ async def get_errata_advisory_info(advisory_id: str) -> Dict[str, Any]:
             "status": "error",
             "advisory_id": advisory_id,
             "message": f"Failed to retrieve advisory {advisory_id}: {str(e)}"
+        }
+
+
+@mcp.tool()
+async def get_errata_advisory_builds(advisory_id: str) -> Dict[str, Any]:
+    """
+    Get builds_list for an advisory with signing info included.
+
+    Args:
+        advisory_id: Advisory ID (numeric ID like '12345')
+
+    Returns:
+        A dictionary containing the raw builds_list JSON and a signing summary.
+    """
+    try:
+        if not advisory_id or not advisory_id.isdigit():
+            raise ValueError("Numeric advisory_id is required (e.g., '12345')")
+        aid = int(advisory_id)
+        builds_list = _fetch_builds_list_with_signing(aid)
+        summary = _summarize_signing(builds_list)
+        return {
+            "status": "success",
+            "advisory_id": advisory_id,
+            "data": builds_list,
+            "signing_summary": summary,
+            "api_url": f"{_get_errata_base_url()}api/v1/erratum/{aid}/builds_list?with_sig_key=1"
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "advisory_id": advisory_id,
+            "message": f"Failed to fetch builds_list: {str(e)}"
         }
 
 def main():

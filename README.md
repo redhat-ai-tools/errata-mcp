@@ -24,6 +24,7 @@ python -c "from mcp_server import get_advisory_info; print(get_advisory_info('14
 - `list_states()` - List advisory states (QE, SHIPPED_LIVE, etc.)
 - `list_advisories(product, state, limit)` - List advisories ⚠️ Limited access
 - `get_advisory_info(advisory_id)` - Get advisory details ⚠️ Requires auth
+- `get_advisory_builds(advisory_id)` - Get builds and signing status ⚠️ Requires auth
 
 ## MCP Client Configuration
 
